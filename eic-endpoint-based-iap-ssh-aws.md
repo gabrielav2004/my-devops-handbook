@@ -152,6 +152,8 @@ aws ec2-instance-connect ssh \
 
 ## CI/CD Setup (GitHub Actions)
 
+Uses `aws ec2-instance-connect ssh` with ephemeral keys — no SSH key management needed.
+
 ### Step 1 — Create IAM User for CI/CD
 
 Create a dedicated IAM user (e.g. `cicd-deploy`) with only the following policy:
@@ -190,24 +192,7 @@ Create a dedicated IAM user (e.g. `cicd-deploy`) with only the following policy:
 }
 ```
 
-### Step 2 — Create Deploy Key Pair
-
-Generate a dedicated SSH key pair for CI/CD (do not reuse personal keys):
-
-```bash
-ssh-keygen -t rsa -b 4096 -f deploy-key -C "cicd-deploy" -N ""
-```
-
-This creates:
-- `deploy-key` — private key (add to GitHub secrets)
-- `deploy-key.pub` — public key (add to EC2 `~/.ssh/authorized_keys`)
-
-**Add public key to EC2:**
-```bash
-cat deploy-key.pub >> ~/.ssh/authorized_keys
-```
-
-### Step 3 — Add GitHub Secrets
+### Step 2 — Add GitHub Secrets
 
 Go to **GitHub → Repo → Settings → Secrets and variables → Actions → New repository secret**
 
@@ -217,9 +202,10 @@ Go to **GitHub → Repo → Settings → Secrets and variables → Actions → N
 | `AWS_SECRET_ACCESS_KEY` | IAM user secret key |
 | `AWS_REGION` | e.g. `ap-south-1` |
 | `EC2_INSTANCE_ID` | e.g. `i-xxxxxxxx` |
-| `EC2_SSH_PRIVATE_KEY` | contents of `deploy-key` file |
 
-### Step 4 — GitHub Actions Workflow
+> No SSH key secret needed — ephemeral keys are generated automatically by AWS CLI.
+
+### Step 3 — GitHub Actions Workflow
 
 **.github/workflows/deploy.yml:**
 
@@ -253,32 +239,22 @@ jobs:
           sudo ./aws/install --update
           aws --version
 
-      - name: Setup SSH key
+      - name: Deploy via EICE
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy-key
-          chmod 400 ~/.ssh/deploy-key
-
-      - name: Add EICE to SSH config
-        run: |
-          cat >> ~/.ssh/config <<EOF
-          Host ec2-target
-            HostName ${{ secrets.EC2_INSTANCE_ID }}
-            User ubuntu
-            IdentityFile ~/.ssh/deploy-key
-            ProxyCommand aws ec2-instance-connect open-tunnel --instance-id %h
-            StrictHostKeyChecking no
-          EOF
-
-      - name: Deploy
-        run: |
-          ssh ec2-target "
-            cd /app &&
-            git pull origin main &&
-            npm install &&
-            pm2 restart app
-          "
+          aws ec2-instance-connect ssh \
+            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --connection-type eice \
+            --os-user ubuntu \
+            --region ${{ secrets.AWS_REGION }} \
+            -- "
+              cd /app &&
+              git pull origin main &&
+              npm install &&
+              pm2 restart app
+            "
 ```
+
+> AWS CLI generates a temporary SSH key pair on the fly, pushes the public key to the instance for 60 seconds, connects, runs the commands, and discards the key. No key management required.
 
 ---
 
@@ -296,7 +272,7 @@ jobs:
 | Permission | Purpose |
 |---|---|
 | `ec2-instance-connect:OpenTunnel` | open the EICE tunnel |
-| `ec2-instance-connect:SendSSHPublicKey` | push ephemeral key to instance |
+| `ec2-instance-connect:SendSSHPublicKey` | push ephemeral key to instance (auto, no key file needed) |
 | `ec2:DescribeInstances` | look up instance details |
 | `ec2:DescribeInstanceConnectEndpoints` | find the endpoint |
 
