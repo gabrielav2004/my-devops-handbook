@@ -153,10 +153,11 @@ aws ec2-instance-connect ssh \
 ## CI/CD Setup (GitHub Actions)
 
 Uses `aws ec2-instance-connect ssh` with ephemeral keys — no SSH key management needed.
+Two authentication approaches are provided: **Access Key** (simpler) and **OIDC** (recommended, no long-lived secrets).
 
-### Step 1 — Create IAM User for CI/CD
+---
 
-Create a dedicated IAM user (e.g. `cicd-deploy`) with only the following policy:
+### IAM Policy (required for both approaches)
 
 ```json
 {
@@ -192,7 +193,15 @@ Create a dedicated IAM user (e.g. `cicd-deploy`) with only the following policy:
 }
 ```
 
-### Step 2 — Add GitHub Secrets
+---
+
+### Approach 1 — Access Key (simpler)
+
+#### Setup
+
+1. Create a dedicated IAM user (e.g. `cicd-deploy`) and attach the policy above
+2. Generate an access key for the user
+3. Add GitHub secrets:
 
 Go to **GitHub → Repo → Settings → Secrets and variables → Actions → New repository secret**
 
@@ -203,9 +212,7 @@ Go to **GitHub → Repo → Settings → Secrets and variables → Actions → N
 | `AWS_REGION` | e.g. `ap-south-1` |
 | `EC2_INSTANCE_ID` | e.g. `i-xxxxxxxx` |
 
-> No SSH key secret needed — ephemeral keys are generated automatically by AWS CLI.
-
-### Step 3 — GitHub Actions Workflow
+#### Workflow
 
 **.github/workflows/deploy.yml:**
 
@@ -232,12 +239,10 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION }}
 
-      - name: Install AWS CLI v2
-        run: |
-          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
-          unzip -q awscliv2.zip
-          sudo ./aws/install --update
-          aws --version
+      - name: Setup AWS CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
 
       - name: Deploy via EICE
         run: |
@@ -254,7 +259,118 @@ jobs:
             "
 ```
 
-> AWS CLI generates a temporary SSH key pair on the fly, pushes the public key to the instance for 60 seconds, connects, runs the commands, and discards the key. No key management required.
+---
+
+### Approach 2 — OIDC (recommended)
+
+No long-lived AWS credentials stored in GitHub. GitHub authenticates directly with AWS using a short-lived token per run.
+
+#### Setup
+
+**Step 1 — Add GitHub as OIDC Identity Provider in AWS**
+
+1. Go to **IAM → Identity providers → Add provider**
+2. Fill in:
+   - Provider type: `OpenID Connect`
+   - Provider URL: `https://token.actions.githubusercontent.com`
+   - Audience: `sts.amazonaws.com`
+3. Click **Add provider**
+
+**Step 2 — Create IAM Role for GitHub Actions**
+
+1. Go to **IAM → Roles → Create role**
+2. Trusted entity type: **Web identity**
+3. Identity provider: `token.actions.githubusercontent.com`
+4. Audience: `sts.amazonaws.com`
+5. Add condition to restrict to your repo:
+
+```json
+{
+  "Condition": {
+    "StringLike": {
+      "token.actions.githubusercontent.com:sub": "repo:your-org/your-repo:ref:refs/heads/main"
+    }
+  }
+}
+```
+
+6. Attach the IAM policy from above
+7. Name the role e.g. `github-actions-eice-deploy`
+8. Copy the **Role ARN**
+
+**Step 3 — Add GitHub Secrets**
+
+| Secret Name | Value |
+|---|---|
+| `AWS_ROLE_ARN` | role ARN e.g. `arn:aws:iam::123456789012:role/github-actions-eice-deploy` |
+| `AWS_REGION` | e.g. `ap-south-1` |
+| `EC2_INSTANCE_ID` | e.g. `i-xxxxxxxx` |
+
+> No `AWS_ACCESS_KEY_ID` or `AWS_SECRET_ACCESS_KEY` needed.
+
+#### Workflow
+
+**.github/workflows/deploy.yml:**
+
+```yaml
+name: Deploy to EC2
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write   # required for OIDC token generation
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Setup AWS CLI
+        uses: aws-actions/setup-sam@v2
+        with:
+          use-installer: true
+
+      - name: Deploy via EICE
+        run: |
+          aws ec2-instance-connect ssh \
+            --instance-id ${{ secrets.EC2_INSTANCE_ID }} \
+            --connection-type eice \
+            --os-user ubuntu \
+            --region ${{ secrets.AWS_REGION }} \
+            -- "
+              cd /app &&
+              git pull origin main &&
+              npm install &&
+              pm2 restart app
+            "
+```
+
+---
+
+### Approach Comparison
+
+| | Access Key | OIDC |
+|---|---|---|
+| Long-lived secrets in GitHub | ✅ yes | ❌ no |
+| Setup complexity | simple | slightly more |
+| Token expiry | never (until rotated) | expires after each run |
+| Recommended for production | ❌ | ✅ |
+| IAM user needed | yes | no (uses IAM role) |
+
+> AWS CLI generates a temporary SSH key pair on the fly, pushes the public key to the instance for 60 seconds, connects, runs the commands, and discards the key. No SSH key management required.
 
 ---
 
